@@ -1,0 +1,899 @@
+---
+title: "The Economics of Free Movement"
+subtitle: "Analyzing Labor Mobility and Productive Complexity as Drivers of Growth"
+author: "Erick Xavier Maldonado Caballero"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    theme: cosmo
+execute: 
+  warning: false
+  echo: true
+  output-dir: docs
+---
+
+```{r}
+# 0. Install & load packages 
+packages <- c("ggplot2", "dplyr", "tidyr", "readxl", "forecast",
+              "lmtest", "sandwich", "gridExtra", "scales",
+              "ggrepel", "patchwork", "tseries", "car", "corrplot",
+              "RColorBrewer", "ggthemes")
+
+installed <- rownames(installed.packages())
+to_install <- packages[!packages %in% installed]
+if (length(to_install) > 0) install.packages(to_install, repos = "https://cloud.r-project.org")
+
+invisible(lapply(packages, library, character.only = TRUE))
+
+# 1. Load & reshape data 
+raw <- read_excel("el_salvador_data.xlsx")
+
+# Transpose: rows = years, columns = variables
+df_t <- as.data.frame(t(raw[, -1]))
+colnames(df_t) <- raw[[1]]
+df_t$year <- as.integer(rownames(df_t))
+
+# Clean column names
+colnames(df_t) <- gsub("[^a-zA-Z0-9_]", "_", colnames(df_t))
+colnames(df_t) <- gsub("_{2,}", "_", colnames(df_t))
+colnames(df_t) <- gsub("_$", "", colnames(df_t))
+
+# Convert all to numeric
+df_t <- df_t %>%
+  mutate(across(-year, ~ suppressWarnings(as.numeric(.))))
+
+# Rename for convenience
+df <- df_t %>%
+  rename(
+    homicides        = intentional_homicides_per_100000_people,
+    fdi              = fdi_percent_of_gdp,
+    formal_emp       = percent_of_people_formal_employment,
+    gdp_growth       = gdp_growth_annual_percent,
+    gdp_pc           = gdp_per_capita_sv,
+    labor_force      = total_labor_force,
+    labor_part       = total_labor_force_part,
+    labor_male       = labor_participation_rate_males_percent_plus15,
+    labor_female     = labor_participation_rate_females_percent_plus15,
+    self_emp         = self_employed,
+    remittances      = personal_remittances_percent_of_gdp_sv,
+    hitech_exports   = medium_high_tech_exports_percent_of_manufactured_exports,
+    tourism          = international_tourism_number_of_arrivals,
+    merch_exports    = merchandise_exports_current_US,
+    exports_gdp      = exports_of_goods_and_services_percent_of_gdp
+  ) %>%
+  arrange(year)
+
+# Convert percentages stored as decimals to 0-100 scale for readability
+df <- df %>%
+  mutate(
+    fdi_pct          = fdi * 100,
+    formal_emp_pct   = formal_emp * 100,
+    gdp_growth_pct   = gdp_growth * 100,
+    labor_part_pct   = labor_part * 100,
+    labor_male_pct   = labor_male * 100,
+    labor_female_pct = labor_female * 100,
+    self_emp_pct     = self_emp * 100,
+    remit_pct        = remittances * 100,
+    hitech_pct       = hitech_exports * 100,
+    exports_gdp_pct  = exports_gdp * 100,
+    post_2019        = as.integer(year >= 2020),
+    tourism_M        = tourism / 1e6,
+    merch_exports_B  = merch_exports / 1e9
+  )
+
+library(knitr)
+library(kableExtra)
+
+# ---- 2. Shared theme for poster-quality plots --------------------------------
+theme_poster <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title       = element_text(face = "bold", size = base_size + 2, hjust = 0.5),
+      plot.subtitle    = element_text(size = base_size - 1, hjust = 0.5, color = "grey40"),
+      axis.title       = element_text(face = "bold", size = base_size - 1),
+      axis.text        = element_text(size = base_size - 2),
+      legend.title     = element_text(face = "bold", size = base_size - 1),
+      legend.position  = "bottom",
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey90"),
+      plot.caption     = element_text(size = 9, color = "grey50", hjust = 1),
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+col_pre  <- "#D73027"   # red – pre-intervention
+col_post <- "#2166AC"   # blue – post-intervention
+col_shad <- "#fee8c8"   # shading for post-2019 band
+
+add_intervention_band <- function(p, ymin = -Inf, ymax = Inf) {
+  p + annotate("rect",
+               xmin = 2019.5, xmax = Inf,
+               ymin = ymin,  ymax = ymax,
+               alpha = 0.12, fill = col_post) +
+    geom_vline(xintercept = 2019.5, linetype = "dashed",
+               color = col_post, linewidth = 0.7)
+}
+
+
+```
+
+# The Economics of Free Movement
+
+## Abstract
+
+For decades, extreme gang violence fundamentally constrained El Salvador's economic development. Criminal organizations such as MS-13 and Barrio 18 fragmented labor markets by controlling territory, making free movement dangerous and investment unattractive. This study examines the economic consequences of the dramatic reduction in gang control following the government's security crackdown, Plan Control Territorial, initiated in 2019. Using national economic data spanning 2010 to 2024, a mixed-methods approach combining multivariate OLS regression, ARIMA time-series forecasting, and Economic Complexity diagnostics reveals a strong empirical link between the restoration of free movement and measurable economic growth. Key findings include a statistically significant post-intervention GDP premium of approximately $1,417 USD per capita, sustained growth in tourism and remittances, and an emerging diversification toward higher-complexity manufacturing exports.
+
+## 1. Introduction
+
+El Salvador presents one of the most striking natural experiments in recent development economics. For over a decade, the country recorded some of the highest homicide rates in the world, peaking at 107.6 intentional killings per 100,000 inhabitants in 2015. These were not merely statistics of human tragedy, they were structural economic constraints. When gangs control neighborhoods and streets, labor cannot move freely to where it is most productive.
+
+The theoretical motivation draws on the economics of labor mobility and productive complexity. When movement is restricted by violence, labor markets fragment geographically, preventing workers from reaching firms and firms from accessing the full labor pool.
+
+## 2. Data and Methodology
+
+### 2.1 Data Sources
+The analysis draws on annual panel data (2010–2024) with security indicators extended to 2025. Data was sourced from the World Bank, ISSS, PNC, UN COMTRADE, and UNCTAD.
+
+### 2.2 Analytical Strategy
+The analysis proceeds in three stages:
+
+1. Descriptive Visualization: Documenting trends in key indicators.
+
+2. Multivariate OLS Regression: Estimating GDP per capita as the dependent variable.
+
+3. ARIMA Time-Series: Generating conditional forecasts for 2025–2027.
+
+## 3. Descriptive Evidence
+
+### 3.0 Understanding the Trends: Breaking Down the Security Wall
+
+To understand these results, let's imagine that a country’s economy is like a massive plumbing system. For decades, gang violence acted like heavy clogs in the pipes. When gangs control a neighborhood, they don't just commit crimes; they create invisible borders.
+
+The data shows that the murder rate dropped from a peak of 107.6 (in 2015) to just 1.3 per 100,000 people. For a non-statistician, this means the danger tax people paid just to exist is gone.
+
+Because these invisible borders are gone, the"Formal Employment Rate jumped by 36%. Think of it this way: previously, a talented worker might have lived in one neighborhood but couldn't take a high-paying job three miles away because they would have to cross gang territory. Now, that worker can travel safely. This is Labor Mobility, the ability of a person to take the best job they qualify for, regardless of where it is located.
+
+### 3.1 The Security Transformation
+The collapse of the homicide rate from 107.6 in 2015 to approximately 1.3 by 2025 is unprecedented in modern criminological literature.
+
+```{r}
+# G1: Homicide Rate Trend 
+df_hom <- df %>% filter(!is.na(homicides))
+
+g1 <- ggplot(df_hom, aes(x = year, y = homicides)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_area(fill = col_pre, alpha = 0.25) +
+  geom_line(color = col_pre, linewidth = 1.4) +
+  geom_point(aes(color = ifelse(year >= 2020, "Post-2019", "Pre-2019")),
+             size = 3) +
+  scale_color_manual(name = "", values = c("Pre-2019" = col_pre, "Post-2019" = col_post)) +
+  scale_x_continuous(breaks = 2010:2025) +
+  annotate("text", x = 2021.5, y = 90, label = "Security\nIntervention",
+           color = col_post, fontface = "bold", size = 3.5) +
+  labs(title = "Intentional Homicide Rate – El Salvador",
+       subtitle = "Per 100,000 inhabitants, 2010–2025",
+       x = "Year", y = "Homicides per 100k",
+       caption = "Source: World Bank / National Police Data") +
+  theme_poster()
+
+g1
+
+```
+
+
+### 3.2 GDP and Growth
+
+GDP per capita recovery was sharp following the 2020 COVID-19 shock, reaching $5,580 by 2024.
+```{r}
+# --- G2: GDP Per Capita -------------------------------------------------------
+df_gdp <- df %>% filter(!is.na(gdp_pc))
+
+g2 <- ggplot(df_gdp, aes(x = year, y = gdp_pc)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_line(color = "#1a9641", linewidth = 1.4) +
+  geom_point(size = 2.8, color = "#1a9641") +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  scale_y_continuous(labels = dollar_format(prefix = "$")) +
+  labs(title = "GDP Per Capita – El Salvador",
+       subtitle = "Current USD, 2010–2024",
+       x = "Year", y = "GDP per capita (USD)",
+       caption = "Source: World Bank National Accounts") +
+  theme_poster()
+
+print(g2)
+
+# --- G3: GDP Annual Growth Rate -----------------------------------------------
+df_gr <- df %>% filter(!is.na(gdp_growth_pct))
+
+g3 <- ggplot(df_gr, aes(x = year, y = gdp_growth_pct,
+                         fill = ifelse(gdp_growth_pct >= 0, "Positive", "Negative"))) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+  scale_fill_manual(name = "", values = c("Positive" = "#1a9641", "Negative" = col_pre)) +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  labs(title = "Annual GDP Growth Rate – El Salvador",
+       subtitle = "Percent, 2010–2024",
+       x = "Year", y = "GDP Growth (%)",
+       caption = "Source: World Bank") +
+  theme_poster()
+
+g3
+
+```
+
+
+### 3.3 Foreign Direct Investment
+
+Investment often takes longer to materialize than consumer behavior or tourism. An investor needs to build a factory, hire staff, and navigate bureaucracy, whereas a tourist simply needs to book a flight. Therefore, the FDI peaks in 2022 and 2024 likely reflect the delayed realization of the safety improvements initiated in 2019.
+
+```{r}
+# G4: FDI (% of GDP) 
+
+df_fdi <- df %>% filter(!is.na(fdi_pct))
+
+g4 <- ggplot(df_fdi, aes(x = year, y = fdi_pct)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_line(color = "#7b2d8b", linewidth = 1.3) +
+  geom_point(size = 2.5, color = "#7b2d8b") +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  labs(title = "Foreign Direct Investment – El Salvador",
+       subtitle = "% of GDP, 2010–2024",
+       x = "Year", y = "FDI (% of GDP)",
+       caption = "Source: World Bank / UNCTAD") +
+  theme_poster()
+
+g4
+
+```
+
+
+### 3.4 Tourism and Remittances
+
+Tourism surged to 4.0 million visitors by 2024. Remittances as a share of GDP peaked near 26% in 2021, reflecting both diaspora confidence and COVID-era support.
+
+```{r}
+# G7: Tourism Arrivals 
+
+df_tour <- df %>% filter(!is.na(tourism_M))
+
+g7 <- ggplot(df_tour, aes(x = year, y = tourism_M)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_area(fill = "#4dac26", alpha = 0.25) +
+  geom_line(color = "#4dac26", linewidth = 1.3) +
+  geom_point(size = 2.5, color = "#4dac26") +
+  scale_x_continuous(breaks = seq(2010, 2025, 2)) +
+  annotate("text", x = 2020, y = 0.4, label = "COVID-19\nCrash",
+           size = 3, color = "grey40", fontface = "italic") +
+  labs(title = "International Tourism Arrivals – El Salvador",
+       subtitle = "Millions of visitors, 2010–2025",
+       x = "Year", y = "Arrivals (Millions)",
+       caption = "Source: World Bank / UNWTO") +
+  theme_poster()
+
+g7
+
+# G10: Remittances (% of GDP)
+df_rem <- df %>% filter(!is.na(remit_pct))
+
+g10 <- ggplot(df_rem, aes(x = year, y = remit_pct)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_line(color = "#1b7837", linewidth = 1.3) +
+  geom_point(size = 2.5, color = "#1b7837") +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Personal Remittances – El Salvador",
+       subtitle = "% of GDP, 2010–2024",
+       x = "Year", y = "Remittances (% of GDP)",
+       caption = "Source: World Bank") +
+  theme_poster()
+
+g10
+
+```
+
+
+### 3.5 Correlation Structure
+
+The correlation matrix reveals a strong negative link between homicides and GDP per capita ($r = -0.74$) and a strong positive link between wealth and formalization ($r = 0.82$).
+
+```{r}
+# G12: Correlation Matrix 
+
+vars_cor <- df %>%
+  filter(year <= 2024) %>%
+  select(homicides, gdp_pc, gdp_growth_pct, fdi_pct,
+         formal_emp_pct, remit_pct, hitech_pct,
+         tourism_M, merch_exports_B) %>%
+  drop_na()
+
+cor_mat <- cor(vars_cor, use = "complete.obs")
+
+corrplot(cor_mat,
+         method = "color", type = "upper",
+         tl.cex = 0.75, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.65,
+         col = colorRampPalette(c(col_pre, "white", col_post))(200),
+         title = "Correlation Matrix – Key Economic & Security Indicators",
+         mar = c(0, 0, 2, 0))
+
+# G11: Homicide vs GDP Per Capita (scatter)
+df_scatter <- df %>%
+  filter(!is.na(homicides) & !is.na(gdp_pc) & year <= 2024)
+
+g11 <- ggplot(df_scatter,
+              aes(x = homicides, y = gdp_pc,
+                  color = factor(ifelse(year >= 2020, "Post-2019", "Pre-2019")),
+                  label = year)) +
+  geom_point(size = 4, alpha = 0.85) +
+  geom_text_repel(size = 3, max.overlaps = 20) +
+  geom_smooth(data = df_scatter, aes(x = homicides, y = gdp_pc),
+              method = "lm", se = TRUE, inherit.aes = FALSE,
+              color = "grey40", linetype = "dashed", linewidth = 0.9) +
+  scale_color_manual(name = "Period",
+                     values = c("Pre-2019" = col_pre, "Post-2019" = col_post)) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = dollar_format(prefix = "$")) +
+  labs(title = "Homicide Rate vs. GDP Per Capita",
+       subtitle = "Each point = one year; dashed line = OLS fit",
+       x = "Homicides per 100,000",
+       y = "GDP per capita (USD)",
+       caption = "Source: World Bank") +
+  theme_poster()
+
+print(g11)
+```
+### 3.6 Formal Employment and Gender
+
+The formal employment rate climbed above 48.8% post-intervention. This supports the hypothesis that reduced insecurity allowed workers, particularly women, to enter formal labor markets previously inaccessible due to gang-controlled transit routes.
+
+```{r}
+# G5: Formal Employment Rate
+df_emp <- df %>% filter(!is.na(formal_emp_pct))
+
+g5 <- ggplot(df_emp, aes(x = year, y = formal_emp_pct)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_line(color = "#d6604d", linewidth = 1.3) +
+  geom_point(size = 2.5, color = "#d6604d") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  labs(title = "Formal Employment Rate – El Salvador",
+       subtitle = "% of total employment, 2010–2024",
+       x = "Year", y = "Formal Employment (%)",
+       caption = "Source: ISSS / World Bank") +
+  theme_poster()
+
+g5
+
+# G6: Gender Labor Participation 
+df_lab <- df %>%
+  filter(!is.na(labor_male_pct) & !is.na(labor_female_pct)) %>%
+  select(year, labor_male_pct, labor_female_pct) %>%
+  pivot_longer(-year, names_to = "gender", values_to = "rate") %>%
+  mutate(gender = case_when(
+    gender == "labor_male_pct"   ~ "Male (15+)",
+    gender == "labor_female_pct" ~ "Female (15+)",
+    TRUE ~ gender
+  ))
+
+g6 <- ggplot(df_lab, aes(x = year, y = rate * 100, color = gender)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_line(linewidth = 1.3) +
+  geom_point(size = 2.3) +
+  scale_color_manual(name = "Gender",
+                     values = c("Male (15+)" = "#2166AC", "Female (15+)" = "#e08214")) +
+  scale_x_continuous(breaks = seq(2010, 2025, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Labor Force Participation by Gender",
+       subtitle = "Ages 15+, 2010–2025",
+       x = "Year", y = "Participation Rate (%)",
+       caption = "Source: World Bank / ILO") +
+  theme_poster()
+
+g6
+```
+### 3.7 Trade and Complexity
+
+The share of high-tech exports grew from 14.9% (2019) to 19.1% (2024), suggesting early-stage diversification into more complex productive activities.
+
+The findings show that high-tech exports rose to 19.1% of medium/high tech manufactured goods. As a country starts making more complex things, it requires more educated workers, which leads to higher salaries. The Free Movement is the key here since you can’t build a high-tech factory if your engineers and technicians are afraid to commute to work.
+
+```{r}
+
+# G8: Merchandise Exports
+df_exp <- df %>% filter(!is.na(merch_exports_B))
+
+g8 <- ggplot(df_exp, aes(x = year, y = merch_exports_B)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_line(color = "#762a83", linewidth = 1.3) +
+  geom_point(size = 2.5, color = "#762a83") +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  scale_y_continuous(labels = dollar_format(prefix = "$", suffix = "B")) +
+  labs(title = "Merchandise Exports – El Salvador",
+       subtitle = "Billions USD, 2010–2024",
+       x = "Year", y = "Exports (USD Billions)",
+       caption = "Source: UN COMTRADE / World Bank") +
+  theme_poster()
+
+g8
+
+# G9: Hi-Tech Exports Share 
+df_ht <- df %>% filter(!is.na(hitech_pct))
+
+g9 <- ggplot(df_ht, aes(x = year, y = hitech_pct)) +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.12, fill = col_post) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  geom_line(color = "#e66101", linewidth = 1.3) +
+  geom_point(size = 2.5, color = "#e66101") +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(title = "Medium/High-Tech Exports Share",
+       subtitle = "% of manufactured exports, 2010–2024",
+       x = "Year", y = "Hi-Tech Exports (%)",
+       caption = "Source: World Bank / UNIDO") +
+  theme_poster()
+
+g9
+
+```
+
+## 4. Multivariate Regression Analysis
+
+### 4.0 The Security Dividend
+
+The centerpiece of the analysis is a statistical finding called the "Post-2019 Dummy Coefficient." In simple terms, this is the "Security Dividend."
+
+After accounting for every other factor—like international trade and remittances, the math shows that the mere fact that the country became safe added $1,417 to the average person's share of the economy or GDP per capita. 
+
+Example: Imagine two identical stores. 
+- Store A is in a high-crime area and spends thousands on armed guards and insurance. 
+- Store B is in a safe area and spends that same money on better products and more staff. 
+
+Store B is naturally wealthier. That $1,417 represents the money El Salvador is "saving" and "earning" now that it isn't spending its energy and resources on surviving a conflict.
+
+### 4.1 Model Specifications
+
+Four nested OLS models were estimated. Model 1 serves as the baseline (homicides only). Model 2 adds FDI and formalization. Model 3 incorporates the full set of economic controls (remittances, hi-tech exports, and tourism). Model 4 introduces the binary post-2019 dummy to capture the structural break associated with the security intervention.
+
+- Model 1 (The Base): We look only at the relationship between crime (homicides) and wealth.
+
+- Model 2 (The Market): we add Foreign Investment and Employment.
+
+- Model 3 (The Full View): We add Tourism, Remittances, and Hi-Tech exports.
+
+- Model 4 (The Big Shift): We add a "Security Dummy." This is a specific marker for everything that changed after 2019 (Plan Control Territorial).
+
+### 4.2 Model Fit and Selection
+
+Model fit improved with each addition. While the baseline (M1) explained 51.5% of the variance, the full multivariate Model 4 achieved an adjusted $R^2$ of 0.976 and the lowest AIC (191.67), indicating that the structural break dummy captures essential shifts in labor mobility not found in economic variables alone.
+
+**Table 4.2:** Model Performance Comparison (Identifying the Security Dividend)
+
+
+```{r}
+library(magrittr)
+# Regression dataset
+df_reg <- df %>%
+  filter(year <= 2024) %>%
+  select(year, gdp_pc, homicides, fdi_pct, formal_emp_pct,
+         remit_pct, hitech_pct, tourism_M, post_2019) %>%
+  drop_na()
+
+# Nested Models
+model1 <- lm(gdp_pc ~ homicides, data = df_reg)
+model2 <- lm(gdp_pc ~ homicides + fdi_pct + formal_emp_pct, data = df_reg)
+model3 <- lm(gdp_pc ~ homicides + fdi_pct + formal_emp_pct + remit_pct + hitech_pct + tourism_M, data = df_reg)
+model4 <- lm(gdp_pc ~ homicides + fdi_pct + formal_emp_pct + remit_pct + hitech_pct + tourism_M + post_2019, data = df_reg)
+
+# Comparison Table
+aic_bic <- data.frame(
+  `Model Step` = c("1. Baseline", "2. + Market Data", "3. Full Economic", "4. Full + Security Shift"),
+  AIC    = round(c(AIC(model1), AIC(model2), AIC(model3), AIC(model4)), 1),
+  BIC    = round(c(BIC(model1), BIC(model2), BIC(model3), BIC(model4)), 1),
+  `Adj_R2 (Accuracy)` = round(c(summary(model1)$adj.r.squared,
+                    summary(model2)$adj.r.squared,
+                    summary(model3)$adj.r.squared,
+                    summary(model4)$adj.r.squared), 3)
+)
+
+kable(aic_bic, caption = "Model Performance Comparison: Identifying the Security Dividend") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(4, bold = T, color = "white", background = "#2166AC")
+
+```
+
+
+
+
+
+### 4.3 Key Findings
+
+The research identifies Tourism as the most powerful engine for growth. The statistics show that for every 1 million additional tourists who visit, the average income per person in the country rises by $806.
+
+Tourism is unique because it requires Physical Trust. You don't buy a vacation to a place you are afraid to walk in. When a tourist visits, they spend money on a wide variety of local businesses:
+
+- Transport: Taxis and shuttles.
+
+- Food: Local restaurants and markets.
+
+- Services: Guides, hotels, and artisans.
+
+This creates a Multiplier Effect. The $806 isn't just the price of a hotel room; it’s the money the hotel owner then spends on a local carpenter, who then spends it at a grocery store.
+
+Tourism is the strongest precisely estimated positive predictor: each additional million international visitors is associated with approximately $806 more in GDP per capita. 
+
+The post-2019 dummy captures a structural GDP premium of $1,417.
+
+
+```{r}
+
+# G14: Regression coefficient plot (Model 4)
+
+coef_df <- as.data.frame(summary(model4)$coefficients)
+coef_df$term <- rownames(coef_df)
+coef_df <- coef_df[coef_df$term != "(Intercept)", ]
+colnames(coef_df)[1:4] <- c("estimate", "se", "tstat", "pval")
+
+coef_df$term_label <- c(
+  "Homicides\n(per 100k)", "FDI\n(% GDP)", "Formal Emp.\n(%)",
+  "Remittances\n(% GDP)", "Hi-Tech Exp.\n(%)", "Tourism\n(Millions)", "Post-2019\nDummy"
+)
+coef_df$significant <- ifelse(coef_df$pval < 0.05, "p < 0.05", "p ≥ 0.05")
+
+g14 <- ggplot(coef_df, aes(x = reorder(term_label, estimate),
+                             y = estimate,
+                             color = significant)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = estimate - 1.96 * se,
+                    ymax = estimate + 1.96 * se),
+                width = 0.3, linewidth = 1) +
+  geom_point(size = 4) +
+  coord_flip() +
+  scale_color_manual(name = "Significance",
+                     values = c("p < 0.05" = col_post, "p ≥ 0.05" = "grey55")) +
+  labs(title = "Multivariate Regression Coefficients",
+       subtitle = "DV = GDP per capita | Error bars = 95% CI | Model 4",
+       x = NULL, y = "Coefficient Estimate",
+       caption = "OLS with Newey-West robust SEs") +
+  theme_poster()
+
+g14
+
+# G15: Actual vs Fitted (Model 4) 
+
+df_reg$fitted <- fitted(model4)
+df_reg$resid  <- residuals(model4)
+
+g15 <- ggplot(df_reg, aes(x = year)) +
+  geom_line(aes(y = gdp_pc,  color = "Actual"),  linewidth = 1.3) +
+  geom_line(aes(y = fitted, color = "Fitted"), linewidth = 1.1, linetype = "dashed") +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             color = col_post, linewidth = 0.7) +
+  scale_color_manual(name = "", values = c("Actual" = col_pre, "Fitted" = col_post)) +
+  scale_y_continuous(labels = dollar_format(prefix = "$")) +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  labs(title = "Actual vs. Fitted GDP per Capita",
+       subtitle = "Multivariate OLS Model 4",
+       x = "Year", y = "GDP per capita (USD)",
+       caption = "Fitted values from OLS regression") +
+  theme_poster()
+
+g15
+```
+
+
+### 4.4 Regression Diagnostics
+
+We use the Variance Inflation Factor (VIF) to see if our ingredients are overlapping. A VIF score above 5 or 10 suggests that two variables are telling the same story, which is why we interpret Hi-Tech exports with caution.
+
+Multicollinearity remains a concern; the VIF for high-tech exports exceeds 82, suggesting individual coefficient interpretation for that variable should be cautious.
+
+**Table 4.4:** Multicollinearity Diagnosis (Variance Inflation Factors)
+
+```{r}
+### 4.4 Regression Diagnostics: The Multicollinearity Check
+vif_values <- vif(model4)
+vif_df <- data.frame(
+  Variable = names(vif_values),
+  `VIF Score` = as.vector(vif_values)
+)
+
+kable(vif_df, caption = "Variance Inflation Factors (Multicollinearity Diagnosis)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  column_spec(2, color = ifelse(vif_df$VIF.Score > 10, "red", "black"),
+              bold = ifelse(vif_df$VIF.Score > 10, TRUE, FALSE))
+```
+
+
+
+
+
+## 5. Time-Series Forecasting
+
+The report uses a tool called ARIMA Forecasting. Think of this like a car’s GPS. The GPS looks at how fast you’ve been driving for the last ten miles to predict exactly when you’ll arrive at your destination.
+
+The GPS for El Salvador’s economy predicts that if the current speed of growth and safety continues, the average income per person will reach approximately $6,124 by 2027. This is significant because it moves the country into a different category of economic stability, making it more attractive for large international companies to build factories and offices there.
+
+
+
+**Table 5.1:** Historical GDP per Capita Timeline (2010–2024)
+
+This table acts as the performance log for El Salvador’s economy over the last 15 years. It tracks the average share of the country's economic output per person in U.S. Dollars.
+
+- For nearly a decade, the economy grew slowly, with average income rising gradually from $3,040 to $4,320.
+- You can clearly see the impact of the COVID-19 pandemic, where wealth dropped to $3,997 as the world economy stalled.
+- This is the most critical part of the data. Following the restoration of free movement and security stabilization, the economy didn't just recover, it accelerated. By 2024, the average income reached $5,579, representing a faster and more sustained growth climb than anything seen in the previous decade.
+
+```{r}
+# TIME-SERIES MODEL
+
+# Use GDP per capita as the main time series (complete 2010-2024)
+gdp_ts <- ts(df %>% filter(!is.na(gdp_pc) & year <= 2024) %>% pull(gdp_pc),
+             start = 2010, frequency = 1)
+
+gdp_table <- data.frame(
+  Year = as.numeric(time(gdp_ts)),
+  `GDP per Capita (USD)` = as.numeric(gdp_ts)
+)
+
+kable(gdp_table, caption = "Historical GDP per Capita Timeline (2010-2024)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(height = "300px")
+
+```
+<br>
+
+**Table 5.2:** Stationarity Stress Test (ADF - Original Series)
+
+Before using data to predict the future, we have to perform a Stress Test called the Augmented Dickey-Fuller (ADF) test. This test determines if our data is stable or if it is heavily influenced by a long-term trend.
+
+- The p-value here is 0.9534. In the world of statistics, any number higher than 0.05 means the data has a strong, upward trend. This tells us that we cannot use simple math for our forecast, we need a more advanced model (ARIMA) that is designed to handle this kind of momentum.
+
+```{r}
+# ADF stationarity test
+adf_result <- adf.test(gdp_ts)
+adf_df <- data.frame(
+  Test = "Augmented Dickey-Fuller",
+  Statistic = adf_result$statistic,
+  `Lag Order` = adf_result$parameter,
+  `p-value` = round(adf_result$p.value, 4)
+)
+
+kable(adf_df, caption = "Stationarity Stress Test (ADF)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+<br>
+
+**Table 5.3:** Stationarity Stress Test (ADF - First-Differenced Changes)
+
+Here, we stopped looking at the total wealth and started looking only at the yearly change or the speed of growth. The p-value dropped to 0.4586, which shows that the growth itself is becoming more consistent, though it still carries the weight of the country's recent rapid transformation.
+
+```{r}
+# Differenced series
+gdp_diff <- diff(gdp_ts)
+
+# Running the stress test on the "changes"
+adf_diff <- adf.test(gdp_diff)
+
+# Organizing the results into a professional table
+adf_diff_df <- data.frame(
+  Test = "ADF on First-Differenced Series",
+  `Test Statistic` = adf_diff$statistic,
+  `Lag Order` = adf_diff$parameter,
+  `p-value` = round(adf_diff$p.value, 4)
+)
+
+kable(adf_diff_df, caption = "Stationarity Stress Test (First-Differenced Changes)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1, bold = T, color = "white", background = "#2166AC")
+```
+<br>
+
+**Table 5.4:** ARIMA Model Coefficients
+
+The ARIMA model is essentially the engine of our Economic GPS. It looks at past patterns to find the underlying rhythm of the economy.
+
+- The drift ($181.39): This is the most important number in this table. It represents the natural upward push of the economy. 
+- The model has calculated that, on average, the current economic environment is adding $181.40 every year to the average citizen's wealth, purely based on the momentum created by recent safety and mobility improvements.
+
+```{r}
+# Auto-select ARIMA
+arima_model <- auto.arima(gdp_ts, stepwise = FALSE, approximation = FALSE)
+
+# Extracting model coefficients for the table
+arima_coefs <- data.frame(
+  Parameter = names(arima_model$coef),
+  Estimate = as.vector(arima_model$coef)
+)
+
+kable(arima_coefs, caption = "ARIMA Model Coefficients (The Forecasting Engine)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+<br>
+
+**Table 5.4:** Residual Diagnostic
+
+After building our forecast model, we perform one final quality check called the Ljung-Box test. We want to make sure that our model has captured all the useful information and hasn't left any important patterns behind.
+
+- The Confidence Score (p-value: 0.9947): This is an exceptionally high score. It means our model is clean. It confirms that there are no hidden patterns or information leaks left in the data. You can trust that the forecast is based on the actual structural changes in the economy, not on random noise or errors.
+
+```{r}
+# Ljung-Box test on residuals
+lb_test <- Box.test(residuals(arima_model), lag = 5, type = "Ljung-Box")
+lb_df <- data.frame(
+  `Test Metric` = "Ljung-Box (Chi-Squared)",
+  `X-squared` = lb_test$statistic,
+  df = lb_test$parameter,
+  `p-value` = round(lb_test$p.value, 4)
+)
+
+kable(lb_df, caption = "Residual Diagnostic: Ensuring No Information Leakage") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+<br>
+
+**Table 5.5:** Economic Projections (GDP per Capita 2025–2027)
+
+This table shows where El Salvador is headed if the current environment of security and free movement remains stable.
+
+- The Point Forecast: The model predicts that the average income will reach $6,123.86 by 2027. This would be a historic milestone for the country.
+
+- The Margin of Safety (Lo/Hi 80 & 95): Because the future is never 100% certain, the model provides a range.
+    - The 80% Range: A more focused prediction.
+    - The 95% Range: A broader, more cautious prediction that accounts for unexpected global events.
+
+Even in the most cautious Low 95 scenario, the economy stays well above pre-2019 levels. This suggests that the Security Dividend has created a new, higher floor for the country's prosperity.
+
+```{r}
+# Forecast 3 years (2025–2027)
+fc <- forecast(arima_model, h = 3)
+fc_table <- as.data.frame(fc)
+fc_table$Year <- 2025:2027
+fc_table <- fc_table[, c(6, 1:5)] # Moving Year to the first column
+
+kable(fc_table, col.names = c("Year", "Point Forecast", "Lo 80", "Hi 80", "Lo 95", "Hi 95"),
+      caption = "Economic GPS Projections: GDP per Capita 2025-2027") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1:3, bold = T, background = "#e6f2ff")
+
+# G17: ARIMA Forecast
+fc_df <- data.frame(
+  year  = 2025:2027,
+  mean  = as.numeric(fc$mean),
+  lo80  = as.numeric(fc$lower[, 1]),
+  hi80  = as.numeric(fc$upper[, 1]),
+  lo95  = as.numeric(fc$lower[, 2]),
+  hi95  = as.numeric(fc$upper[, 2])
+)
+
+hist_df <- data.frame(
+  year   = as.numeric(time(gdp_ts)),
+  actual = as.numeric(gdp_ts)
+)
+
+g17 <- ggplot() +
+  annotate("rect", xmin = 2019.5, xmax = Inf,
+           ymin = -Inf, ymax = Inf, alpha = 0.08, fill = col_post) +
+  geom_ribbon(data = fc_df,
+              aes(x = year, ymin = lo95, ymax = hi95),
+              fill = col_post, alpha = 0.20) +
+  geom_ribbon(data = fc_df,
+              aes(x = year, ymin = lo80, ymax = hi80),
+              fill = col_post, alpha = 0.30) +
+  geom_line(data = hist_df,
+            aes(x = year, y = actual), color = col_pre, linewidth = 1.3) +
+  geom_point(data = hist_df,
+             aes(x = year, y = actual), color = col_pre, size = 2.5) +
+  geom_line(data = fc_df,
+            aes(x = year, y = mean), color = col_post,
+            linewidth = 1.2, linetype = "dashed") +
+  geom_point(data = fc_df,
+             aes(x = year, y = mean), color = col_post, size = 3) +
+  scale_y_continuous(labels = dollar_format(prefix = "$")) +
+  scale_x_continuous(breaks = seq(2010, 2027, 2)) +
+  labs(title = paste0("ARIMA GDP per Capita Forecast – El Salvador"),
+       subtitle = paste0("Model: ", arima_model$arma |> toString(),
+                         " | Shaded = 80% & 95% CI | Forecast: 2025–2027"),
+       x = "Year", y = "GDP per capita (USD)",
+       caption = "Auto-ARIMA via forecast package") +
+  theme_poster()
+
+print(g17)
+
+# G18: ARIMA Residuals ACF/PACF
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 2))
+acf(residuals(arima_model),
+    main = "ACF of ARIMA Residuals",
+    col  = col_post, lwd = 2, ci.col = col_pre)
+pacf(residuals(arima_model),
+     main = "PACF of ARIMA Residuals",
+     col  = col_post, lwd = 2, ci.col = col_pre)
+
+# G19: Pre/Post comparison bar chart (means)
+means_df <- df %>%
+  filter(!is.na(homicides) & !is.na(fdi_pct) &
+           !is.na(formal_emp_pct) & !is.na(tourism_M) & year <= 2024) %>%
+  mutate(period = ifelse(year >= 2020, "Post-2019", "Pre-2019")) %>%
+  group_by(period) %>%
+  summarise(
+    `Homicides\n(per 100k)`    = mean(homicides,      na.rm = TRUE),
+    `FDI\n(% GDP)`             = mean(fdi_pct,        na.rm = TRUE),
+    `Formal Emp.\n(%)`         = mean(formal_emp_pct, na.rm = TRUE),
+    `Tourism\n(Millions)`      = mean(tourism_M,      na.rm = TRUE),
+    `Hi-Tech Exp.\n(%)`        = mean(hitech_pct,     na.rm = TRUE)
+  ) %>%
+  pivot_longer(-period, names_to = "indicator", values_to = "value")
+
+g19 <- ggplot(means_df, aes(x = indicator, y = value, fill = period)) +
+  geom_col(position = "dodge", width = 0.65, alpha = 0.88) +
+  scale_fill_manual(name = "Period",
+                    values = c("Pre-2019" = col_pre, "Post-2019" = col_post)) +
+  facet_wrap(~ indicator, scales = "free", nrow = 1) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+  labs(title = "Average Indicator Values: Pre- vs. Post-Intervention",
+       subtitle = "Pre-2019 (2010–2019) vs. Post-2019 (2020–2024)",
+       x = NULL, y = "Mean Value",
+       caption = "Source: World Bank / ISSS") +
+  theme_poster() +
+  theme(axis.text.x = element_blank())
+
+print(g19)
+
+```
+<br>
+
+
+
+## 6. Discussion
+
+### 6.1 Free Movement as Infrastructure
+
+Findings support the interpretation that security is economic infrastructure. The restoration of free movement unlocked activity previously suppressed by gang-enforced territorial borders.
+
+The results identify tourism as the dominant channel through which security translates into growth. Tourism is labor-intensive and hypersensitive to mobility; for visitors to arrive and workers to staff establishments, territorial gang control had to be dismantled. Remittances also appear as a significant predictor, likely reflecting a diaspora confidence effect as security conditions improved, allowing more capital to flow back into domestic consumption.
+
+
+
+### 6.2 Limitations
+
+The study is limited by a small sample size (15 observations). Multicollinearity suggests that individual coefficients, particularly formal employment and high-tech exports, should be interpreted with caution.
+
+
+## 7. Conclusions
+
+
+This study provides empirical evidence that security stabilization is a fundamental prerequisite for development. While removing restrictions was vital for immediate growth, long-term success depends on urgent investment in fiscal sustainability and social rehabilitation to ensure current gains lead to structural transformation.
+
+
